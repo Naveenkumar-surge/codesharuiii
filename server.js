@@ -8,6 +8,7 @@ import dotenv from "dotenv";
 import {
   S3Client,
   CreateMultipartUploadCommand,
+  GetObjectCommand,
   UploadPartCommand,
   CompleteMultipartUploadCommand,
   AbortMultipartUploadCommand,
@@ -83,12 +84,31 @@ io.on("connection", (socket) => {
 
   // Join room
   socket.on("join-room", (roomId) => {
-    socket.join(roomId);
-    if (!roomMessages[roomId]) roomMessages[roomId] = { messages: [], contentType: "text" };
 
-    // Send last messages + current content type
-    socket.emit("room-messages", roomMessages[roomId].messages);
-    socket.emit("room-contentType", roomMessages[roomId].contentType);
+    socket.join(roomId);
+
+    if (!roomMessages[roomId]) {
+      roomMessages[roomId] = {
+        messages: [],
+        contentType: "text",
+        currentText: ""
+      };
+    }
+
+    socket.emit(
+      "room-messages",
+      roomMessages[roomId].messages
+    );
+
+    socket.emit(
+      "room-contentType",
+      roomMessages[roomId].contentType
+    );
+
+    socket.emit(
+      "room-current-text",
+      roomMessages[roomId].currentText || ""
+    );
   });
 
   // Handle content type changes
@@ -101,12 +121,43 @@ io.on("connection", (socket) => {
   });
 
   // Handle text messages
-  socket.on("room-message", ({ roomId, type, content, fileName, fileType, data, uploadedAt }) => {
-    if (!roomMessages[roomId]) roomMessages[roomId] = { messages: [], contentType: "text" };
-    const message = { type, content, fileName, fileType, data, uploadedAt };
+  socket.on("room-message", ({ roomId, type, content, fileName, fileType, data, uploadedAt, s3Key }) => {
+
+    if (!roomMessages[roomId]) {
+      roomMessages[roomId] = {
+        messages: [],
+        contentType: "text",
+        currentText: ""
+      };
+    }
+
+    if (type === "text") {
+
+      roomMessages[roomId].currentText = content;
+
+      io.to(roomId).emit("room-message", {
+        type: "text",
+        content
+      });
+
+      return;
+    }
+
+    const message = {
+      type,
+      fileName,
+      fileType,
+      data,
+      uploadedAt,
+      s3Key,
+      removed: false
+    };
 
     roomMessages[roomId].messages.push(message);
-    if (roomMessages[roomId].messages.length > 5) roomMessages[roomId].messages.shift();
+
+    if (roomMessages[roomId].messages.length > 5) {
+      roomMessages[roomId].messages.shift();
+    }
 
     io.to(roomId).emit("room-message", message);
   });
@@ -191,7 +242,10 @@ io.on("connection", (socket) => {
         return;
       }
       const { Key, roomId } = activeMultipartUploads.get(uploadId);
-
+      console.log("UPLOAD ID:", uploadId);
+      console.log("KEY:", Key);
+      console.log("PARTS:");
+      console.log(JSON.stringify(parts, null, 2));
       const res = await s3Client.send(
         new CompleteMultipartUploadCommand({
           Bucket: S3_BUCKET,
@@ -204,7 +258,8 @@ io.on("connection", (socket) => {
       clearTimeout(activeMultipartUploads.get(uploadId).timeoutHandle);
       activeMultipartUploads.delete(uploadId);
 
-      const location = res.Location || `s3://${S3_BUCKET}/${Key}`;
+      const location =
+        `https://codesharuiii.onrender.com/download/${encodeURIComponent(Key)}`;
       const fileMessage = {
         type: "file",
         fileName: path.basename(Key),
@@ -217,7 +272,11 @@ io.on("connection", (socket) => {
       if (roomMessages[roomId].messages.length > 5) roomMessages[roomId].messages.shift();
 
       io.to(roomId).emit("room-message", fileMessage);
-      socket.emit("complete-success", { uploadId, location });
+      socket.emit("complete-success", {
+        uploadId,
+        location,
+        s3Key: Key
+      });
 
       // Delete after 4 min
       setTimeout(async () => {
@@ -228,7 +287,7 @@ io.on("connection", (socket) => {
         } catch (err) {
           console.error("Error deleting file:", err);
         }
-      }, 30 * 60 * 1000);
+      }, 25 * 60 * 1000);
 
       console.log(`✅ Completed upload: ${location}`);
     } catch (err) {
@@ -334,6 +393,47 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   } catch (err) {
     console.error("upload error:", err);
     res.status(500).json({ message: err.message });
+  }
+});
+app.get("/download/:key", async (req, res) => {
+  try {
+    const key = decodeURIComponent(req.params.key);
+
+    const response = await s3Client.send(
+      new GetObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: key,
+      })
+    );
+
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${path.basename(key)}"`
+    );
+
+    res.setHeader(
+      "Content-Type",
+      "application/octet-stream"
+    );
+
+    response.Body.pipe(res);
+
+  } catch (err) {
+    console.error(err);
+
+    if (
+      err.name === "NoSuchKey" ||
+      err.Code === "NoSuchKey" ||
+      err.$metadata?.httpStatusCode === 404
+    ) {
+      return res.status(404).json({
+        message: "File removed from server"
+      });
+    }
+
+    return res.status(500).json({
+      message: "Download failed"
+    });
   }
 });
 
