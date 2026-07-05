@@ -5,7 +5,6 @@ import { Server } from "socket.io";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
-import pngToIcoRoute from "./image/pngToIco.js";
 import {
   S3Client,
   CreateMultipartUploadCommand,
@@ -36,7 +35,6 @@ app.use(cors({
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use("/api", pngToIcoRoute);
 
 // === SOCKET.IO SETUP ===
 const io = new Server(server, {
