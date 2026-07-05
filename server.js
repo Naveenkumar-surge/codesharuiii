@@ -5,6 +5,7 @@ import { Server } from "socket.io";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
+import pngToIcoRoute from "./image/pngToIco.js";
 import {
   S3Client,
   CreateMultipartUploadCommand,
@@ -25,6 +26,17 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
+import cors from "cors";
+
+app.use(cors({
+  origin: "http://localhost:3000",
+  methods: ["GET", "POST"],
+  credentials: false
+}));
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use("/api", pngToIcoRoute);
 
 // === SOCKET.IO SETUP ===
 const io = new Server(server, {
@@ -56,6 +68,15 @@ if (!S3_BUCKET) {
 // Active multipart uploads
 const activeMultipartUploads = new Map(); // { uploadId: { Key, roomId, timeoutHandle } }
 const roomMessages = {}; // last 5 messages per room
+const activeFiles = new Map();
+// s3Key ->
+// {
+//   roomId,
+//   ownerId,
+//   timeoutHandle,
+//   expiresAt,
+//   updated:false
+// }
 
 // === Helper: auto-abort multipart uploads ===
 function scheduleMultipartAbort(uploadId, key, ttlMs = 300 * 60 * 1000, roomId = null) {
@@ -95,10 +116,25 @@ io.on("connection", (socket) => {
       };
     }
 
-    socket.emit(
-      "room-messages",
-      roomMessages[roomId].messages
-    );
+    const messages = roomMessages[roomId].messages.map(msg => {
+
+    const file = activeFiles.get(msg.s3Key);
+
+    if (file) {
+
+        return {
+            ...msg,
+            expiresAt: file.expiresAt,
+            timerStarted: file.timerStarted
+        };
+
+    }
+
+    return msg;
+
+});
+
+socket.emit("room-messages", messages);
 
     socket.emit(
       "room-contentType",
@@ -121,7 +157,16 @@ io.on("connection", (socket) => {
   });
 
   // Handle text messages
-  socket.on("room-message", ({ roomId, type, content, fileName, fileType, data, uploadedAt, s3Key }) => {
+  socket.on("room-message", ({
+    roomId,
+    type,
+    content,
+    fileName,
+    fileType,
+    data,
+    uploadedAt,
+    s3Key
+  }) => {
 
     if (!roomMessages[roomId]) {
       roomMessages[roomId] = {
@@ -182,7 +227,8 @@ io.on("connection", (socket) => {
       }
       socket.uploadSessions[UploadId] = { Key };
 
-      // ✅ Also track globally so complete-multipart can see it
+      // ✅ Also track globally so 
+      // tipart can see it
       activeMultipartUploads.set(UploadId, {
         Key,
         roomId,
@@ -265,6 +311,11 @@ io.on("connection", (socket) => {
         fileName: path.basename(Key),
         data: location,
         s3Key: Key,
+        uploadedAt: Date.now(),
+
+        removed: false,
+        timerStarted: false,
+        expiresAt: null
       };
 
       if (!roomMessages[roomId]) roomMessages[roomId] = { messages: [], contentType: "text" };
@@ -279,21 +330,167 @@ io.on("connection", (socket) => {
       });
 
       // Delete after 4 min
-      setTimeout(async () => {
-        try {
-          await s3Client.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key }));
-          io.to(roomId).emit("file-removed", { s3Key: Key });
-          console.log(`🗑️ Deleted from S3: ${Key}`);
-        } catch (err) {
-          console.error("Error deleting file:", err);
-        }
-      }, 25 * 60 * 1000);
+      const timeoutHandle = setTimeout(() => {
+
+        const file = activeFiles.get(Key);
+
+        if (!file) return;
+
+        if (file.timerStarted) return;
+
+        file.timerStarted = true;
+
+        file.expiresAt = Date.now() + 20 * 60 * 1000;
+        const msg = roomMessages[file.roomId].messages.find(
+    m => m.s3Key === Key
+);
+
+if (msg) {
+    msg.timerStarted = true;
+    msg.expiresAt = file.expiresAt;
+}
+
+        io.to(roomId).emit("timer-started", {
+          s3Key: Key,
+          expiresAt: file.expiresAt
+        });
+
+        file.timeoutHandle = setTimeout(async () => {
+
+          try {
+
+            await s3Client.send(
+              new DeleteObjectCommand({
+                Bucket: S3_BUCKET,
+                Key
+              })
+            );
+            const msg = roomMessages[file.roomId].messages.find(
+              m => m.s3Key === s3Key
+            );
+
+            if (msg) {
+              msg.removed = true;
+            }
+
+            io.to(roomId).emit("file-removed", {
+              s3Key: Key
+            });
+
+            activeFiles.delete(Key);
+
+          } catch (err) {
+
+            console.error(err);
+
+          }
+
+        }, 20 * 60 * 1000);
+
+      }, 20 * 60 * 1000);
+
+      activeFiles.set(Key, {
+        roomId,
+        timeoutHandle,
+        uploadedAt: Date.now(),
+        expiresAt: null,
+        timerStarted: false,
+        updated: false
+      });
 
       console.log(`✅ Completed upload: ${location}`);
     } catch (err) {
       console.error("complete-multipart error:", err);
       socket.emit("complete-error", { message: err.message });
     }
+  });
+
+  socket.on("delete-file", async ({ s3Key }) => {
+
+    const file = activeFiles.get(s3Key);
+    if (!file) return;
+
+    clearTimeout(file.timeoutHandle);
+
+    await s3Client.send(
+      new DeleteObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: s3Key
+      })
+    );
+
+    const msg = roomMessages[file.roomId].messages.find(
+      m => m.s3Key === s3Key
+    );
+
+    if (msg) {
+      msg.removed = true;
+    }
+
+    io.to(file.roomId).emit("file-removed", {
+      s3Key
+    });
+
+    activeFiles.delete(s3Key);
+    socket.emit("file-delete-success", {
+      message: "File deleted successfully."
+    });
+
+  });
+  socket.on("change-expiry", ({ s3Key, minutes }) => {
+
+    const file = activeFiles.get(s3Key);
+    console.log("the current file", file);
+
+    if (!file) return;
+
+    clearTimeout(file.timeoutHandle);
+
+    file.timeoutHandle = setTimeout(async () => {
+
+      await s3Client.send(
+        new DeleteObjectCommand({
+          Bucket: S3_BUCKET,
+          Key: s3Key
+        })
+      );
+      const msg = roomMessages[file.roomId].messages.find(
+        m => m.s3Key === s3Key
+      );
+
+      if (msg) {
+        msg.removed = true;
+      }
+
+      io.to(file.roomId).emit("file-removed", {
+        s3Key
+      });
+      console.log("file deleted successfully");
+
+      activeFiles.delete(s3Key);
+
+    }, minutes * 60 * 1000);
+
+    file.timerStarted = true;
+
+    file.expiresAt = Date.now() + minutes * 60 * 1000;
+    const msg = roomMessages[file.roomId].messages.find(
+      m => m.s3Key === s3Key
+    );
+
+    if (msg) {
+      msg.timerStarted = true;
+      msg.expiresAt = file.expiresAt;
+    }
+
+    io.to(file.roomId).emit("timer-started", {
+      s3Key,
+      expiresAt: file.expiresAt
+    });
+    socket.emit("timer-updated-success", {
+      message: `Timer updated successfully to ${minutes} minute(s).`
+    });
+
   });
 
   socket.on("disconnect", () => {
@@ -436,6 +633,61 @@ app.get("/download/:key", async (req, res) => {
     });
   }
 });
+setInterval(() => {
+
+  activeFiles.forEach((file, key) => {
+
+    if (file.updated) return;
+
+
+    if (!file.timerStarted) {
+
+      const passed =
+        Date.now() - file.uploadedAt;
+
+      if (passed >= 20 * 60 * 1000) {
+
+        clearTimeout(file.timeoutHandle);
+
+        file.timeoutHandle = setTimeout(async () => {
+
+          await s3Client.send(
+            new DeleteObjectCommand({
+              Bucket: S3_BUCKET,
+              Key: key
+            })
+          );
+
+          io.to(file.roomId).emit("file-removed", {
+            s3Key: key
+          });
+
+          activeFiles.delete(key);
+
+        }, 20 * 60 * 1000);
+
+        file.updated = true;
+        file.timerStarted = true;
+        file.expiresAt = Date.now() + 20 * 60 * 1000;
+
+        const msg = roomMessages[file.roomId].messages.find(
+          m => m.s3Key === key
+        );
+
+        if (msg) {
+          msg.timerStarted = true;
+          msg.expiresAt = file.expiresAt;
+        }
+
+        io.to(file.roomId).emit("timer-started", {
+          s3Key: key,
+          expiresAt: file.expiresAt
+        });
+      }
+    }
+  });
+
+}, 60000);
 
 // === START SERVER ===
 const PORT = process.env.PORT || 5000;
